@@ -2,9 +2,25 @@ import { useEffect, useState, useRef } from 'react';
 import { useParams, useLocation, useNavigate } from 'react-router-dom';
 import io from 'socket.io-client';
 import YouTube from 'react-youtube';
-import { Users, Search, Play, Pause, SkipForward, SkipBack, ListVideo, Video, Headphones, Copy, UserPlus, Heart, MoreHorizontal, Volume2, Maximize2, Repeat, Shuffle, GripVertical, Mic2 } from 'lucide-react';
+import { Users, Search, Play, Pause, SkipForward, SkipBack, ListVideo, Copy, UserPlus, Heart, MoreHorizontal, Volume2, Volume1, VolumeX, Repeat, Shuffle, GripVertical, Mic2 } from 'lucide-react';
+import { getCachedSearch, setCachedSearch } from '../utils/searchCache';
 
-const SOCKET_SERVER_URL = import.meta.env.VITE_BACKEND_URL || (typeof window !== 'undefined' ? `http://${window.location.hostname}:3001` : '');
+const SOCKET_SERVER_URL = import.meta.env.VITE_BACKEND_URL || (typeof window !== 'undefined' ? `http://${window.location.hostname}:5001` : '');
+
+const PLAYER_OPTS = {
+  width: '100%',
+  height: '100%',
+  playerVars: {
+    autoplay: 1,
+    controls: 0,
+    modestbranding: 1,
+    disablekb: 1,
+    fs: 0,
+    rel: 0,
+    iv_load_policy: 3,
+    origin: typeof window !== 'undefined' ? window.location.origin : undefined
+  }
+};
 
 const getCleanTitle = (title) => {
   if (!title) return '...';
@@ -36,20 +52,49 @@ const parseSyncedLyrics = (lrcString) => {
   return parsed.length > 0 ? parsed : null;
 };
 
+const parseIsoDuration = (duration) => {
+  if (!duration) return 0;
+  const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!match) return 0;
+  const hours = parseInt(match[1] || 0, 10);
+  const minutes = parseInt(match[2] || 0, 10);
+  const seconds = parseInt(match[3] || 0, 10);
+  return hours * 3600 + minutes * 60 + seconds;
+};
+
+const isShortsItem = (item) => {
+  if (!item) return false;
+  const title = (item.snippet?.title || item.title || '').toLowerCase();
+  const desc = (item.snippet?.description || item.description || '').toLowerCase();
+  const blacklist = ['#shorts', '#short', 'shorts', 'short', 'tiktok', 'reels', 'whatsapp status', 'status video'];
+  return blacklist.some(b => title.includes(b) || desc.includes(b));
+};
+
 export default function Room() {
   const { roomId } = useParams();
+  const cleanRoomId = (roomId || '').trim().toUpperCase();
   const location = useLocation();
   const navigate = useNavigate();
-  const username = location.state?.username;
+  const effectiveUsername = location.state?.username || sessionStorage.getItem('space_music_username') || `Astronaut_${Math.floor(Math.random() * 899 + 100)}`;
+
+  useEffect(() => {
+    if (location.state?.username) {
+      sessionStorage.setItem('space_music_username', location.state.username);
+    }
+  }, [location.state?.username]);
 
   const [socket, setSocket] = useState(null);
   const [users, setUsers] = useState([]);
+  const [hostSocketId, setHostSocketId] = useState(null);
+  const [mySocketId, setMySocketId] = useState(null);
 
   const [currentSong, setCurrentSong] = useState(null);
   const [songDetails, setSongDetails] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [queue, setQueue] = useState([]);
-  const [isVideoMode, setIsVideoMode] = useState(false);
+  const [volume, setVolume] = useState(80);
+  const [isMuted, setIsMuted] = useState(false);
+  const prevVolumeRef = useRef(80);
 
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -59,93 +104,190 @@ export default function Room() {
 
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
+  const [isCachedSearch, setIsCachedSearch] = useState(false);
+
+  const isHost = mySocketId && hostSocketId ? mySocketId === hostSocketId : true;
+  const isHostRef = useRef(true);
+  useEffect(() => {
+    isHostRef.current = isHost;
+  }, [isHost]);
 
   const playerRef = useRef(null);
-  const ignoreNextEvent = useRef(false);
+  const socketRef = useRef(null);
+  const currentSongRef = useRef(null);
+  const isPlayingRef = useRef(false);
+  const currentTimeRef = useRef(0);
+  const ignoreEventsUntil = useRef(0);
+  const lastErrorSkipRef = useRef(0);
+  const hasEndedEmittedForSong = useRef(null);
+  const initialMountedSongId = useRef(currentSong || '');
 
   useEffect(() => {
-    if (!username) {
-      navigate('/');
-      return;
-    }
+    currentSongRef.current = currentSong;
+  }, [currentSong]);
 
-    const newSocket = io(SOCKET_SERVER_URL);
+  useEffect(() => {
+    isPlayingRef.current = isPlaying;
+  }, [isPlaying]);
+
+  useEffect(() => {
+    currentTimeRef.current = currentTime;
+  }, [currentTime]);
+
+  useEffect(() => {
+    socketRef.current = socket;
+  }, [socket]);
+
+  useEffect(() => {
+    const newSocket = io(SOCKET_SERVER_URL, {
+      reconnection: true,
+      reconnectionAttempts: 15,
+      reconnectionDelay: 1000
+    });
     setSocket(newSocket);
 
-    newSocket.emit('join_room', { roomId, username });
+    newSocket.on('connect', () => {
+      console.log('Socket connected/reconnected:', newSocket.id);
+      setMySocketId(newSocket.id);
+      newSocket.emit('join_room', { roomId: cleanRoomId, username: effectiveUsername });
+    });
 
     newSocket.on('room_state', (state) => {
-      setUsers(state.users);
-      setQueue(state.queue);
+      setUsers(state.users || []);
+      setQueue(state.queue || []);
+      if (state.hostSocketId) {
+        setHostSocketId(state.hostSocketId);
+      }
       if (state.currentSong) {
         setCurrentSong(state.currentSong);
+        currentSongRef.current = state.currentSong;
         setSongDetails(state.songDetails);
         setIsPlaying(state.isPlaying);
-        setCurrentTime(state.timestamp);
+        isPlayingRef.current = state.isPlaying;
+        setCurrentTime(state.timestamp || 0);
+        currentTimeRef.current = state.timestamp || 0;
+        if (playerRef.current && state.currentSong) {
+          try {
+            if (playerRef.current.loadVideoById) {
+              playerRef.current.loadVideoById(state.currentSong, state.timestamp || 0);
+            }
+            if (state.isPlaying && playerRef.current.playVideo) {
+              playerRef.current.playVideo();
+            }
+          } catch (e) {
+            console.error('Error applying initial room state to player:', e);
+          }
+        }
       }
     });
 
-    newSocket.on('user_joined', ({ users }) => setUsers(users));
-    newSocket.on('user_left', ({ users }) => setUsers(users));
-    newSocket.on('queue_update', (newQueue) => setQueue(newQueue));
-
-    newSocket.on('play_new_song', ({ videoId, details, timestamp }) => {
-      ignoreNextEvent.current = true;
-      setCurrentSong(videoId);
-      setSongDetails(details);
-      setIsPlaying(true);
-      setCurrentTime(timestamp);
-      setDuration(0);
+    newSocket.on('user_joined', ({ users }) => setUsers(users || []));
+    newSocket.on('user_left', ({ users }) => setUsers(users || []));
+    newSocket.on('queue_update', (newQueue) => setQueue(newQueue || []));
+    newSocket.on('host_changed', ({ hostSocketId: newHostId }) => {
+      setHostSocketId(newHostId);
     });
 
-    newSocket.on('stop_song', ({ lastDetails }) => {
+    newSocket.on('play_new_song', ({ videoId, details, timestamp }) => {
+      ignoreEventsUntil.current = Date.now() + 4000;
+      hasEndedEmittedForSong.current = null;
+      setCurrentSong(videoId);
+      currentSongRef.current = videoId;
+      setSongDetails(details);
+      setIsPlaying(true);
+      isPlayingRef.current = true;
+      setCurrentTime(timestamp || 0);
+      currentTimeRef.current = timestamp || 0;
+      setDuration(0);
+
+      if (playerRef.current) {
+        try {
+          if (playerRef.current.loadVideoById) {
+            playerRef.current.loadVideoById(videoId, timestamp || 0);
+          }
+          if (playerRef.current.playVideo) {
+            playerRef.current.playVideo();
+          }
+        } catch (e) {
+          console.error('Error loading video on play_new_song:', e);
+        }
+      }
+    });
+
+    newSocket.on('stop_song', () => {
       setCurrentSong(null);
+      currentSongRef.current = null;
       setSongDetails(null);
       setIsPlaying(false);
-
-      // Only the first user (Host) triggers the auto-next to avoid duplicates
-      setUsers(currentUsers => {
-        const isHost = currentUsers.length > 0 && currentUsers[0].username === username;
-        if (isHost && lastDetails) {
-          fetchAndPopulateUpNext(lastDetails);
-        }
-        return currentUsers;
-      });
+      isPlayingRef.current = false;
+      if (playerRef.current && playerRef.current.stopVideo) {
+        try {
+          playerRef.current.stopVideo();
+        } catch (e) {}
+      }
     });
 
     newSocket.on('sync_play', ({ timestamp }) => {
-      ignoreNextEvent.current = true;
+      ignoreEventsUntil.current = Date.now() + 1500;
       setIsPlaying(true);
+      isPlayingRef.current = true;
       setCurrentTime(timestamp);
+      currentTimeRef.current = timestamp;
       if (playerRef.current) {
-        playerRef.current.seekTo(timestamp, true);
-        playerRef.current.playVideo();
+        try {
+          if (playerRef.current.seekTo) playerRef.current.seekTo(timestamp, true);
+          if (playerRef.current.playVideo) playerRef.current.playVideo();
+        } catch (e) {}
       }
     });
 
     newSocket.on('sync_pause', ({ timestamp }) => {
-      ignoreNextEvent.current = true;
+      ignoreEventsUntil.current = Date.now() + 1500;
       setIsPlaying(false);
+      isPlayingRef.current = false;
       setCurrentTime(timestamp);
+      currentTimeRef.current = timestamp;
       if (playerRef.current) {
-        playerRef.current.seekTo(timestamp, true);
-        playerRef.current.pauseVideo();
+        try {
+          if (playerRef.current.seekTo) playerRef.current.seekTo(timestamp, true);
+          if (playerRef.current.pauseVideo) playerRef.current.pauseVideo();
+        } catch (e) {}
       }
     });
 
     return () => newSocket.disconnect();
-  }, [roomId, username, navigate]);
+  }, [cleanRoomId, effectiveUsername]);
 
   // Update current time continuously with a robust polling mechanism
   useEffect(() => {
-    const interval = setInterval(() => {
-      if (playerRef.current && playerRef.current.getPlayerState) {
-        // getPlayerState() === 1 means the video is actively playing
-        if (playerRef.current.getPlayerState() === 1) {
-          setCurrentTime(playerRef.current.getCurrentTime() || 0);
+    const interval = setInterval(async () => {
+      if (!playerRef.current) return;
+      try {
+        let state = -1;
+        if (typeof playerRef.current.getPlayerState === 'function') {
+          const res = playerRef.current.getPlayerState();
+          state = res && typeof res.then === 'function' ? await res : res;
         }
-      }
-    }, 100); // 100ms for near-instant lyric syncing
+        if (state === 1) {
+          let time = 0;
+          if (typeof playerRef.current.getCurrentTime === 'function') {
+            const timeRes = playerRef.current.getCurrentTime();
+            time = timeRes && typeof timeRes.then === 'function' ? await timeRes : timeRes;
+          }
+          if (typeof time === 'number' && !isNaN(time)) {
+            setCurrentTime(time);
+            currentTimeRef.current = time;
+          }
+          if (typeof playerRef.current.getDuration === 'function') {
+            const durRes = playerRef.current.getDuration();
+            const dur = durRes && typeof durRes.then === 'function' ? await durRes : durRes;
+            if (typeof dur === 'number' && dur > 0) {
+              setDuration(dur);
+            }
+          }
+        }
+      } catch (e) {}
+    }, 200);
     return () => clearInterval(interval);
   }, []);
 
@@ -194,25 +336,76 @@ export default function Room() {
 
   const onPlayerReady = (event) => {
     playerRef.current = event.target;
-    setDuration(event.target.getDuration() || 0);
+    const dur = event.target.getDuration ? event.target.getDuration() : 0;
+    setDuration(dur || 0);
+    try {
+      if (event.target.setVolume) {
+        event.target.setVolume(isMuted ? 0 : volume);
+      }
+      if (isMuted && event.target.mute) {
+        event.target.mute();
+      }
+    } catch (e) {
+      console.error('Error applying initial volume in onPlayerReady:', e);
+    }
+    if (currentSongRef.current) {
+      try {
+        if (event.target.loadVideoById) {
+          event.target.loadVideoById(currentSongRef.current, currentTimeRef.current || 0);
+        }
+        if (isPlayingRef.current && event.target.playVideo) {
+          event.target.playVideo();
+        }
+      } catch (e) {
+        console.error('Error loading video in onPlayerReady:', e);
+      }
+    }
   };
 
-  const onStateChange = (event) => {
-    if (!socket || ignoreNextEvent.current) {
-      ignoreNextEvent.current = false;
+  const onStateChange = async (event) => {
+    const liveSocket = socketRef.current;
+    if (!liveSocket || Date.now() < ignoreEventsUntil.current) {
       return;
     }
-    const timestamp = playerRef.current.getCurrentTime();
-    setDuration(playerRef.current.getDuration() || 0);
+
+    let timestamp = 0;
+    let dur = 0;
+    try {
+      if (playerRef.current?.getCurrentTime) {
+        const t = playerRef.current.getCurrentTime();
+        timestamp = t && typeof t.then === 'function' ? await t : t;
+      }
+      if (playerRef.current?.getDuration) {
+        const d = playerRef.current.getDuration();
+        dur = d && typeof d.then === 'function' ? await d : d;
+      }
+    } catch (e) {}
+
+    if (typeof dur === 'number' && dur > 0) {
+      setDuration(dur);
+    }
 
     if (event.data === 1) {
       setIsPlaying(true);
-      socket.emit('sync_play', { roomId, timestamp });
+      isPlayingRef.current = true;
+      if (isHostRef.current) {
+        liveSocket.emit('sync_play', { roomId: cleanRoomId, timestamp: timestamp || 0 });
+      }
     } else if (event.data === 2) {
       setIsPlaying(false);
-      socket.emit('sync_pause', { roomId, timestamp });
+      isPlayingRef.current = false;
+      if (isHostRef.current) {
+        liveSocket.emit('sync_pause', { roomId: cleanRoomId, timestamp: timestamp || 0 });
+      }
     } else if (event.data === 0) {
-      socket.emit('song_ended', { roomId, lastVideoId: currentSong });
+      // 0 = YT.PlayerState.ENDED
+      // Only host triggers next song on natural end, and only if video actually reached near the end
+      if (isHostRef.current && dur > 10 && timestamp >= (dur - 4) && currentSongRef.current) {
+        if (hasEndedEmittedForSong.current !== currentSongRef.current) {
+          hasEndedEmittedForSong.current = currentSongRef.current;
+          liveSocket.emit('song_ended', { roomId: cleanRoomId, lastVideoId: currentSongRef.current });
+        }
+      }
     }
   };
 
@@ -235,77 +428,103 @@ export default function Room() {
         if (isPlaying) togglePlay();
       });
       navigator.mediaSession.setActionHandler('nexttrack', skipNext);
+      navigator.mediaSession.setActionHandler('previoustrack', skipPrevious);
     }
   }, [songDetails, isPlaying, currentSong]);
 
   const handleSearch = async (e) => {
     e.preventDefault();
-    if (!searchQuery.trim()) return;
+    const query = searchQuery.trim();
+    if (!query) return;
 
     // Check if it is a direct YouTube URL
-    const urlMatch = searchQuery.match(/(?:v=|\/)([0-9A-Za-z_-]{11}).*/);
+    const urlMatch = query.match(/(?:v=|\/)([0-9A-Za-z_-]{11}).*/);
     if (urlMatch) {
       const videoId = urlMatch[1];
       handleAddToQueue(videoId);
       return;
     }
 
-    const API_KEY = 'AIzaSyANRBDBHFV9yON6GU9walyF9dHaggulou0';
+    // 1. Check IndexedDB cache first to save quota tokens
     try {
-      const res = await fetch(`https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(searchQuery)}&type=video&maxResults=10&key=${API_KEY}`);
-      const data = await res.json();
-      if (data.items) {
-        setSearchResults(data.items);
+      const cachedItems = await getCachedSearch(query);
+      if (cachedItems && cachedItems.length > 0) {
+        // Exclude legacy shorts from cache if any
+        const cleanCached = cachedItems.filter(it => !isShortsItem(it));
+        if (cleanCached.length > 0) {
+          setSearchResults(cleanCached);
+          setIsCachedSearch(true);
+          return; // Zero quota used!
+        }
+      }
+    } catch (cacheErr) {
+      console.warn('Error checking IndexedDB search cache:', cacheErr);
+    }
+
+    // 2. Fetch from backend search proxy (keeps API key server-side, avoids CORS + 429)
+    try {
+      const proxyRes = await fetch(`${SOCKET_SERVER_URL}/api/search?q=${encodeURIComponent(query)}`);
+      if (!proxyRes.ok) {
+        const errData = await proxyRes.json().catch(() => ({}));
+        console.error('Search proxy error:', proxyRes.status, errData);
+        return;
+      }
+      const cleanVideos = await proxyRes.json();
+
+      if (Array.isArray(cleanVideos) && cleanVideos.length > 0) {
+        setSearchResults(cleanVideos);
+        setIsCachedSearch(false);
+        // 3. Persist in IndexedDB for subsequent same-query searches
+        await setCachedSearch(query, cleanVideos);
+      } else {
+        setSearchResults([]);
       }
     } catch (err) {
       console.error('Search failed', err);
     }
   };
 
-  const fetchAndPopulateUpNext = async (details) => {
-    if (!details || !socket) return;
-    const API_KEY = 'AIzaSyANRBDBHFV9yON6GU9walyF9dHaggulou0';
-    // Use just the channel to get their other top songs instead of the same song name
-    const query = encodeURIComponent(`${details.channel} top hit songs`);
-    try {
-      const res = await fetch(`https://www.googleapis.com/youtube/v3/search?part=snippet&q=${query}&type=video&maxResults=10&key=${API_KEY}`);
-      const data = await res.json();
-      if (data.items && data.items.length > 0) {
-        // Filter out the current song and any exact title matches to avoid repeats
-        const nextItems = data.items
-          .filter(item => item.id.videoId !== details.videoId && !item.snippet.title.includes(details.title.substring(0, 10)))
-          .map(item => ({
-            videoId: item.id.videoId,
-            title: item.snippet.title,
-            channel: item.snippet.channelTitle,
-            thumbnail: item.snippet.thumbnails.high.url
-          }));
-
-        if (nextItems.length > 0) {
-          socket.emit('append_multiple_to_queue', { roomId, items: nextItems });
-        }
-      }
-    } catch (err) {
-      console.error('Failed to populate up next', err);
-    }
-  };
-
   const handleAddToQueue = (item) => {
     const isDirectId = typeof item === 'string';
-    const videoId = isDirectId ? item : item.id.videoId;
+    const videoId = isDirectId ? item : (item.videoId || item.id?.videoId || (typeof item.id === 'string' ? item.id : null));
+    if (!videoId) {
+      console.error('Cannot add to queue: missing videoId', item);
+      return;
+    }
     const details = isDirectId ? { videoId, title: 'Unknown Song (via ID)', channel: '', thumbnail: `https://img.youtube.com/vi/${videoId}/default.jpg` } : {
       videoId,
-      title: item.snippet.title,
-      channel: item.snippet.channelTitle,
-      thumbnail: item.snippet.thumbnails.high.url
+      title: item.snippet?.title || item.title || 'Unknown Song',
+      channel: item.snippet?.channelTitle || item.channel || '',
+      thumbnail: item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.medium?.url || item.snippet?.thumbnails?.default?.url || item.thumbnail || `https://img.youtube.com/vi/${videoId}/default.jpg`
     };
 
-    // Play the newly searched song immediately!
-    socket.emit('play_now', { roomId, item: details });
+    // Optimistic local play
+    ignoreEventsUntil.current = Date.now() + 4000;
+    hasEndedEmittedForSong.current = null;
+    setCurrentSong(videoId);
+    currentSongRef.current = videoId;
+    setSongDetails(details);
+    setIsPlaying(true);
+    isPlayingRef.current = true;
+    setCurrentTime(0);
+    currentTimeRef.current = 0;
 
-    // Auto-populate the rest of the queue based on this new song
-    if (!isDirectId) {
-      fetchAndPopulateUpNext(details);
+    if (playerRef.current) {
+      try {
+        if (playerRef.current.loadVideoById) {
+          playerRef.current.loadVideoById(videoId, 0);
+        }
+        if (playerRef.current.playVideo) {
+          playerRef.current.playVideo();
+        }
+      } catch (e) {
+        console.error('Error starting video playback locally:', e);
+      }
+    }
+
+    // Play the newly searched song across room members
+    if (socket) {
+      socket.emit('play_now', { roomId: cleanRoomId, item: details });
     }
 
     setSearchResults([]);
@@ -313,38 +532,55 @@ export default function Room() {
   };
 
   const togglePlay = () => {
-    if (!playerRef.current || !currentSong) return;
-    const timestamp = playerRef.current.getCurrentTime();
+    if (!playerRef.current || !currentSongRef.current) return;
+    const timestamp = playerRef.current?.getCurrentTime ? playerRef.current.getCurrentTime() : 0;
     if (isPlaying) {
-      playerRef.current.pauseVideo();
-      socket.emit('sync_pause', { roomId, timestamp });
+      if (playerRef.current.pauseVideo) playerRef.current.pauseVideo();
+      socket.emit('sync_pause', { roomId: cleanRoomId, timestamp });
       setIsPlaying(false);
+      isPlayingRef.current = false;
     } else {
-      playerRef.current.playVideo();
-      socket.emit('sync_play', { roomId, timestamp });
+      if (playerRef.current.playVideo) playerRef.current.playVideo();
+      socket.emit('sync_play', { roomId: cleanRoomId, timestamp });
       setIsPlaying(true);
+      isPlayingRef.current = true;
     }
   };
 
   const skipNext = () => {
-    if (currentSong && socket) {
-      socket.emit('song_ended', { roomId, lastVideoId: currentSong });
+    if (socket) {
+      socket.emit('skip_song', { roomId: cleanRoomId });
     }
   };
 
-  const handlePlayQueueItem = (index) => {
-    if (socket) {
-      socket.emit('play_queue_item', { roomId, index });
+  const skipPrevious = () => {
+    if (currentTime > 3 && playerRef.current?.seekTo) {
+      playerRef.current.seekTo(0, true);
+      setCurrentTime(0);
+      currentTimeRef.current = 0;
+      if (socket) {
+        socket.emit('sync_play', { roomId: cleanRoomId, timestamp: 0 });
+      }
+    } else if (socket) {
+      socket.emit('prev_song', { roomId: cleanRoomId });
+    }
+  };
+
+  const handlePlayQueueItem = (item, index) => {
+    if (socket && item) {
+      const videoId = item.videoId || item.id?.videoId || item.id;
+      socket.emit('play_queue_item', { roomId: cleanRoomId, videoId, index });
     }
   };
 
   const handleSeek = (e) => {
     const newTime = parseFloat(e.target.value);
     setCurrentTime(newTime);
-    if (playerRef.current) {
+    currentTimeRef.current = newTime;
+    if (playerRef.current?.seekTo) {
       playerRef.current.seekTo(newTime, true);
       if (socket) {
-        socket.emit('sync_play', { roomId, timestamp: newTime });
+        socket.emit('sync_play', { roomId: cleanRoomId, timestamp: newTime });
       }
     }
   };
@@ -362,8 +598,89 @@ export default function Room() {
     background: `linear-gradient(to right, #a855f7 ${progressPercent}%, rgba(255, 255, 255, 0.1) ${progressPercent}%)`
   };
 
+  const handleVolumeChange = (e) => {
+    const newVol = parseInt(e.target.value, 10);
+    setVolume(newVol);
+    if (newVol > 0 && isMuted) {
+      setIsMuted(false);
+      if (playerRef.current?.unMute) {
+        playerRef.current.unMute();
+      }
+    }
+    if (newVol === 0) {
+      setIsMuted(true);
+    }
+    if (playerRef.current?.setVolume) {
+      playerRef.current.setVolume(newVol);
+    }
+  };
+
+  const toggleMute = () => {
+    if (isMuted) {
+      const targetVol = prevVolumeRef.current > 0 ? prevVolumeRef.current : 80;
+      setIsMuted(false);
+      setVolume(targetVol);
+      if (playerRef.current?.unMute) playerRef.current.unMute();
+      if (playerRef.current?.setVolume) playerRef.current.setVolume(targetVol);
+    } else {
+      prevVolumeRef.current = volume > 0 ? volume : 80;
+      setIsMuted(true);
+      setVolume(0);
+      if (playerRef.current?.mute) playerRef.current.mute();
+    }
+  };
+
+  const renderVolumeIcon = () => {
+    if (isMuted || volume === 0) {
+      return <VolumeX size={18} className="volume-icon volume-muted-icon" />;
+    }
+    if (volume < 50) {
+      return <Volume1 size={18} className="volume-icon volume-low-icon" />;
+    }
+    return <Volume2 size={18} className="volume-icon volume-high-icon" />;
+  };
+
+  const currentVolume = isMuted ? 0 : volume;
+  const volumeStyle = {
+    background: `linear-gradient(to right, #a855f7 ${currentVolume}%, rgba(255, 255, 255, 0.15) ${currentVolume}%)`
+  };
+
   return (
     <div className="app-container">
+
+      {/* YouTube Audio Engine - Always mounted offscreen to prevent iframe re-init on song select */}
+      <div
+        className="youtube-offscreen-player-container"
+        style={{
+          position: 'fixed',
+          top: '-9999px',
+          left: '-9999px',
+          width: '400px',
+          height: '300px',
+          opacity: 0.001,
+          pointerEvents: 'none',
+          zIndex: -1
+        }}
+      >
+        <YouTube
+          videoId={initialMountedSongId.current || ''}
+          opts={PLAYER_OPTS}
+          onReady={onPlayerReady}
+          onStateChange={onStateChange}
+          onError={(err) => {
+            console.error('YouTube Player Error:', err);
+            if (!isHostRef.current) return;
+            const now = Date.now();
+            if (now - lastErrorSkipRef.current > 4000) {
+              lastErrorSkipRef.current = now;
+              skipNext();
+            }
+          }}
+          className="youtube-offscreen-iframe"
+          style={{ width: '400px', height: '300px', pointerEvents: 'none' }}
+        />
+      </div>
+
       <div className="main-content">
 
         {/* Left Sidebar */}
@@ -379,9 +696,9 @@ export default function Room() {
           <div className="room-card">
             <div>
               <div style={{ fontSize: '0.7rem', color: '#a1a1aa', marginBottom: '4px', fontWeight: 'bold', letterSpacing: '1px' }}>ROOM ID</div>
-              <div style={{ fontSize: '1.2rem', fontWeight: '800', letterSpacing: '2px' }}>{roomId}</div>
+              <div style={{ fontSize: '1.2rem', fontWeight: '800', letterSpacing: '2px' }}>{cleanRoomId}</div>
             </div>
-            <button className="control-btn" onClick={() => navigator.clipboard.writeText(roomId)} title="Copy Room ID">
+            <button className="control-btn" onClick={() => navigator.clipboard.writeText(cleanRoomId)} title="Copy Room ID">
               <Copy size={18} />
             </button>
           </div>
@@ -399,7 +716,7 @@ export default function Room() {
                   </div>
                   <div style={{ flex: 1 }}>
                     <div style={{ fontSize: '0.9rem', fontWeight: '600', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                      <span className="text-truncate">{u.username} {u.username === username ? '(You)' : ''}</span>
+                      <span className="text-truncate">{u.username} {u.username === effectiveUsername ? '(You)' : ''}</span>
                       {i === 0 && <span style={{ color: '#fbbf24', fontSize: '0.8rem' }}>👑</span>}
                     </div>
                     <div style={{ fontSize: '0.75rem', color: '#a1a1aa' }}>
@@ -420,106 +737,117 @@ export default function Room() {
         <div className="center-view glass-panel">
 
           <div className="search-container">
-            <form onSubmit={handleSearch}>
-              <Search className="search-icon" size={20} />
-              <input
-                type="text"
-                className="input-field"
-                placeholder="Search a song to add to queue..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-              />
-            </form>
+            {isHost ? (
+              <form onSubmit={handleSearch} className="search-form-host">
+                <Search className="search-icon" size={20} />
+                <input
+                  type="text"
+                  className="input-field"
+                  placeholder="Search a song to add to queue..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+              </form>
+            ) : (
+              <div className="search-form-viewer-locked" style={{ position: 'relative' }}>
+                <Search className="search-icon" size={20} style={{ opacity: 0.4 }} />
+                <input
+                  type="text"
+                  className="input-field"
+                  placeholder="Only the host can search songs..."
+                  disabled
+                  style={{ opacity: 0.45, cursor: 'not-allowed' }}
+                />
+              </div>
+            )}
           </div>
 
           <div className="center-scroll">
             {searchResults.length > 0 ? (
-              <div style={{ width: '100%', maxWidth: '700px' }}>
-                <h3 style={{ margin: '0 0 1rem 0', color: '#e4e4e7' }}>Search Results</h3>
+              <div className="search-results-container" style={{ width: '100%', maxWidth: '700px' }}>
+                <div className="search-results-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem' }}>
+                  <h3 className="search-results-title" style={{ margin: 0, color: '#e4e4e7' }}>Search Results</h3>
+                  {isCachedSearch && (
+                    <span
+                      className="search-cache-badge"
+                      style={{
+                        fontSize: '0.75rem',
+                        color: '#22c55e',
+                        background: 'rgba(34, 197, 94, 0.12)',
+                        border: '1px solid rgba(34, 197, 94, 0.3)',
+                        padding: '3px 10px',
+                        borderRadius: '12px',
+                        fontWeight: '600'
+                      }}
+                    >
+                      ⚡ Loaded from IndexedDB (0 Quota Used)
+                    </span>
+                  )}
+                </div>
                 {searchResults.map(item => (
-                  <div key={item.id.videoId} className="queue-item" onClick={() => handleAddToQueue(item)} style={{ background: 'rgba(255,255,255,0.03)', marginBottom: '12px', cursor: 'pointer' }}>
-                    <img src={item.snippet.thumbnails.default.url} alt="thumbnail" />
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div className="text-truncate" style={{ fontWeight: '600', color: '#fff', fontSize: '1rem', marginBottom: '4px' }}>{item.snippet.title}</div>
-                      <div className="text-truncate" style={{ fontSize: '0.85rem', color: '#a1a1aa' }}>{item.snippet.channelTitle}</div>
+                  <div
+                    key={item.id.videoId}
+                    className="queue-item search-result-item"
+                    onClick={() => isHost && handleAddToQueue(item)}
+                    style={{ background: 'rgba(255,255,255,0.03)', marginBottom: '12px', cursor: isHost ? 'pointer' : 'default', opacity: isHost ? 1 : 0.6 }}
+                  >
+                    <img className="search-result-thumb" src={item.snippet.thumbnails.default.url} alt="thumbnail" />
+                    <div className="search-result-meta" style={{ flex: 1, minWidth: 0 }}>
+                      <div className="search-result-title text-truncate" style={{ fontWeight: '600', color: '#fff', fontSize: '1rem', marginBottom: '4px' }}>
+                        {item.snippet.title}
+                      </div>
+                      <div className="search-result-channel text-truncate" style={{ fontSize: '0.85rem', color: '#a1a1aa' }}>
+                        {item.snippet.channelTitle}
+                      </div>
                     </div>
                   </div>
                 ))}
               </div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, width: '100%' }}>
-                {currentSong ? (
-                  <div className="active-song-card">
-                    <div className="artwork-container">
-                      {/* Audio Mode Image */}
-                      <img
-                        src={songDetails ? songDetails.thumbnail : `https://img.youtube.com/vi/${currentSong}/maxresdefault.jpg`}
-                        alt="Album Art"
-                        style={{
-                          width: '100%',
-                          height: '100%',
-                          objectFit: 'cover',
-                          opacity: isVideoMode ? 0 : 1,
-                          position: 'absolute',
-                          top: 0,
-                          left: 0,
-                          transition: 'opacity 0.3s ease',
-                          zIndex: 1
-                        }}
-                      />
-
-                      {/* Video Player */}
-                      <div style={{
+                {/* Active song card - always keep player mounted in DOM */}
+                <div className="active-song-card" style={{ display: currentSong ? 'flex' : 'none', flexDirection: 'column', alignItems: 'center', width: '100%' }}>
+                  <div className="artwork-container album-artwork-container">
+                    {/* Album Art Image - Always visible */}
+                    <img
+                      src={songDetails ? songDetails.thumbnail : (currentSong ? `https://img.youtube.com/vi/${currentSong}/maxresdefault.jpg` : null)}
+                      alt="Album Art"
+                      className="artwork-image album-art-cover"
+                      style={{
                         width: '100%',
                         height: '100%',
+                        objectFit: 'cover',
                         position: 'absolute',
                         top: 0,
                         left: 0,
-                        zIndex: 2,
-                        opacity: isVideoMode ? 1 : 0,
-                        pointerEvents: isVideoMode ? 'auto' : 'none',
-                        transition: 'opacity 0.3s ease'
-                      }}>
-                        {/* Glass Shield to block ALL clicks to YouTube */}
-                        <div style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', zIndex: 10, background: 'transparent' }} />
-                        <YouTube
-                          videoId={currentSong}
-                          opts={{ width: '100%', height: '100%', playerVars: { autoplay: 1, controls: 0, modestbranding: 1, disablekb: 1, fs: 0, rel: 0, iv_load_policy: 3 } }}
-                          onReady={onPlayerReady}
-                          onStateChange={onStateChange}
-                          style={{ width: '100%', height: '100%', pointerEvents: 'none', transform: 'scale(1.4)', transformOrigin: 'center center' }}
-                        />
-                      </div>
-                    </div>
+                        zIndex: 1,
+                        borderRadius: '16px'
+                      }}
+                    />
+                  </div>
 
-                    <div style={{ width: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: '100%', marginTop: '8px', position: 'relative' }}>
-                        <div style={{ flex: 1, textAlign: 'center', minWidth: 0 }}>
-                          <h2 className="text-truncate" style={{ margin: '0 0 4px 0', fontSize: '15px', fontWeight: '600' }}>
-                            {songDetails ? getCleanTitle(songDetails.title) : 'Playing Song...'}
-                          </h2>
-                        </div>
-                        <div style={{ position: 'absolute', right: '0' }}>
-                          <Heart size={24} color="#ec4899" fill="#ec4899" style={{ cursor: 'pointer', filter: 'drop-shadow(0 0 10px rgba(236, 72, 153, 0.5))' }} />
-                        </div>
+                  <div className="active-song-meta-container" style={{ width: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                    <div className="active-song-title-wrapper" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: '100%', marginTop: '8px', position: 'relative' }}>
+                      <div className="active-song-text-box" style={{ flex: 1, textAlign: 'center', minWidth: 0 }}>
+                        <h2 className="active-song-title text-truncate" style={{ margin: '0 0 4px 0', fontSize: '15px', fontWeight: '600' }}>
+                          {songDetails ? getCleanTitle(songDetails.title) : 'Playing Song...'}
+                        </h2>
                       </div>
-                      <div className="genre-pills">
-                        <span className="pill">Chill</span>
-                        <span className="pill">Electronic</span>
-                        <span className="pill">Lo-Fi</span>
-                        <span className="pill">Space</span>
+                      <div className="active-song-heart-wrapper" style={{ position: 'absolute', right: '0' }}>
+                        <Heart className="active-song-heart-icon" size={24} color="#ec4899" fill="#ec4899" style={{ cursor: 'pointer', filter: 'drop-shadow(0 0 10px rgba(236, 72, 153, 0.5))' }} />
                       </div>
                     </div>
                   </div>
-                ) : (
-                  <div style={{ color: '#a1a1aa', textAlign: 'center', opacity: 0.6, display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-                    <div style={{ width: '80px', height: '80px', borderRadius: '50%', background: 'rgba(255,255,255,0.05)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '24px' }}>
-                      <Search size={40} color="#a855f7" />
-                    </div>
-                    <h2 style={{ color: '#fff', marginBottom: '8px' }}>Search for a song to start listening</h2>
-                    <p style={{ fontSize: '0.9rem' }}>Find your next track and listen together with your room.</p>
+                </div>
+
+                {/* Empty State placeholder - displayed when no song is playing */}
+                <div className="empty-player-placeholder" style={{ display: currentSong ? 'none' : 'flex', color: '#a1a1aa', textAlign: 'center', opacity: 0.6, flexDirection: 'column', alignItems: 'center' }}>
+                  <div style={{ width: '80px', height: '80px', borderRadius: '50%', background: 'rgba(255,255,255,0.05)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '24px' }}>
+                    <Search size={40} color="#a855f7" />
                   </div>
-                )}
+                  <h2 style={{ color: '#fff', marginBottom: '8px' }}>Search for a song to start listening</h2>
+                  <p style={{ fontSize: '0.9rem' }}>Find your next track and listen together with your room.</p>
+                </div>
               </div>
             )}
           </div>
@@ -551,11 +879,16 @@ export default function Room() {
                 </div>
               ) : (
                 queue.map((item, index) => (
-                  <div key={index} className="queue-item" onClick={() => handlePlayQueueItem(index)}>
+                  <div
+                    key={item.videoId || index}
+                    className="queue-item"
+                    onClick={() => isHost && handlePlayQueueItem(item, index)}
+                    style={{ cursor: isHost ? 'pointer' : 'default' }}
+                  >
                     <div style={{ width: '24px', fontSize: '0.9rem', color: '#a1a1aa', fontWeight: 'bold' }}>
                       {(index + 1).toString().padStart(2, '0')}
                     </div>
-                    <img src={item.thumbnail} alt="thumb" />
+                    <img src={item.thumbnail || `https://img.youtube.com/vi/${item.videoId}/default.jpg`} alt="thumb" />
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div className="text-truncate" style={{ fontSize: '0.95rem', fontWeight: '600', color: '#fff', marginBottom: '4px' }}>
                         {getCleanTitle(item.title)}
@@ -630,13 +963,13 @@ export default function Room() {
 
         <div className="player-center">
           <div className="player-controls">
-            <button className="control-btn"><Shuffle size={18} /></button>
-            <button className="control-btn"><SkipBack size={22} fill="currentColor" /></button>
-            <button className="control-btn play-circle-btn" onClick={togglePlay}>
+            <button className="control-btn player-control-btn control-btn-shuffle" title="Shuffle" disabled={!isHost} style={{ opacity: isHost ? 1 : 0.35, cursor: isHost ? 'pointer' : 'not-allowed' }}><Shuffle size={18} /></button>
+            <button className="control-btn player-control-btn control-btn-prev" onClick={isHost ? skipPrevious : undefined} title="Previous track" disabled={!isHost} style={{ opacity: isHost ? 1 : 0.35, cursor: isHost ? 'pointer' : 'not-allowed' }}><SkipBack size={22} fill="currentColor" /></button>
+            <button className="control-btn player-control-btn control-btn-play play-circle-btn" onClick={isHost ? togglePlay : undefined} title={isPlaying ? "Pause" : "Play"} disabled={!isHost} style={{ opacity: isHost ? 1 : 0.35, cursor: isHost ? 'pointer' : 'not-allowed' }}>
               {isPlaying ? <Pause size={20} fill="#fff" /> : <Play size={20} fill="#fff" style={{ marginLeft: '4px' }} />}
             </button>
-            <button className="control-btn" onClick={skipNext}><SkipForward size={22} fill="currentColor" /></button>
-            <button className="control-btn"><Repeat size={18} /></button>
+            <button className="control-btn player-control-btn control-btn-next" onClick={isHost ? skipNext : undefined} title="Next track" disabled={!isHost} style={{ opacity: isHost ? 1 : 0.35, cursor: isHost ? 'pointer' : 'not-allowed' }}><SkipForward size={22} fill="currentColor" /></button>
+            <button className="control-btn player-control-btn control-btn-repeat" title="Repeat" disabled={!isHost} style={{ opacity: isHost ? 1 : 0.35, cursor: isHost ? 'pointer' : 'not-allowed' }}><Repeat size={18} /></button>
           </div>
 
           <div className="progress-container">
@@ -646,28 +979,38 @@ export default function Room() {
               min={0}
               max={duration || 100}
               value={currentTime}
-              onChange={handleSeek}
+              onChange={isHost ? handleSeek : undefined}
               className="progress-bar"
-              style={progressStyle}
+              style={{ ...progressStyle, cursor: isHost ? 'pointer' : 'not-allowed' }}
+              disabled={!isHost}
             />
             <span>{formatTime(duration)}</span>
           </div>
         </div>
 
-        <div className="player-right">
-          <Volume2 size={18} color="#a1a1aa" />
-          <div style={{ width: '80px', height: '4px', background: 'rgba(255,255,255,0.2)', borderRadius: '2px', position: 'relative' }}>
-            <div style={{ position: 'absolute', top: 0, left: 0, height: '100%', width: '70%', background: '#a855f7', borderRadius: '2px' }}></div>
-            <div style={{ position: 'absolute', top: '-4px', left: '70%', width: '12px', height: '12px', background: '#fff', borderRadius: '50%', boxShadow: '0 0 5px rgba(0,0,0,0.5)' }}></div>
-          </div>
+        <div className="player-right volume-player-container">
           <button
-            className="video-mode-btn"
-            onClick={() => setIsVideoMode(!isVideoMode)}
+            className="control-btn volume-mute-btn"
+            onClick={toggleMute}
+            title={isMuted ? "Unmute" : "Mute"}
           >
-            {isVideoMode ? <Headphones size={16} /> : <Video size={16} />}
-            {isVideoMode ? 'Audio Mode' : 'Video Mode'}
+            {renderVolumeIcon()}
           </button>
-          <Maximize2 size={16} color="#a1a1aa" style={{ cursor: 'pointer', marginLeft: '8px' }} />
+          <div className="volume-slider-wrapper">
+            <input
+              type="range"
+              min={0}
+              max={100}
+              value={currentVolume}
+              onChange={handleVolumeChange}
+              className="volume-slider player-volume-slider"
+              style={volumeStyle}
+              title={`Volume: ${currentVolume}%`}
+            />
+          </div>
+          <span className="volume-percent-label">
+            {currentVolume}%
+          </span>
         </div>
       </div>
     </div>

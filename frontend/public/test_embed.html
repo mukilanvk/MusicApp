@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head><title>Test Embed Othaiyadi</title></head>
+<body>
+<h1>Testing Othaiyadi Pathayila</h1>
+<div id="player"></div>
+<pre id="log"></pre>
+<script src="https://www.youtube.com/iframe_api"></script>
+<script>
+  function log(msg) {
+    document.getElementById('log').innerText += msg + '\n';
+    console.log(msg);
+  }
+  let player;
+  function onYouTubeIframeAPIReady() {
+    log('API Ready');
+    player = new YT.Player('player', {
+      height: '200',
+      width: '300',
+      videoId: 'qP8e7lFdEho', // Kanaa - Othaiyadi Pathayila Video (Sony Music South)
+      events: {
+        'onReady': () => { log('Player Ready! Starting playback...'); player.playVideo(); },
+        'onStateChange': (e) => log('State Change: ' + e.data),
+        'onError': (e) => log('ERROR: ' + e.data)
+      }
+    });
+  }
+</script>
+</body>
+</html>
